@@ -98,36 +98,104 @@ async def _do_login(page: Page, context: BrowserContext) -> bool:
     await page.wait_for_timeout(2000)
     await _dismiss_popups(page)
 
-    try:
-        await page.wait_for_selector('input[name="username"]', timeout=10000)
-    except Exception:
-        logger.error("Форма логина не найдена — возможно Instagram изменил структуру страницы")
+    # Instagram removed name attributes — use type selectors
+    username_selectors = [
+        'input[name="username"]',
+        'input[type="text"]',
+        'input[aria-label*="username" i]',
+        'input[aria-label*="phone" i]',
+    ]
+    password_selectors = [
+        'input[name="password"]',
+        'input[type="password"]',
+    ]
+    submit_selectors = [
+        'button[type="submit"]',
+        'div[role="button"]:has-text("Log in")',
+        'button:has-text("Log in")',
+        'button:has-text("Log In")',
+    ]
+
+    # Fill username
+    filled_user = False
+    for sel in username_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3000):
+                await el.fill(IG_USERNAME)
+                filled_user = True
+                break
+        except Exception:
+            pass
+
+    if not filled_user:
+        logger.error("Поле username не найдено — Instagram мог изменить структуру страницы")
         return False
 
-    await page.fill('input[name="username"]', IG_USERNAME)
     await page.wait_for_timeout(300)
-    await page.fill('input[name="password"]', IG_PASSWORD)
-    await page.wait_for_timeout(300)
-    await page.click('button[type="submit"]')
 
-    # Wait for redirect away from login page (up to 15s)
+    # Fill password
+    for sel in password_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3000):
+                await el.fill(IG_PASSWORD)
+                break
+        except Exception:
+            pass
+
+    await page.wait_for_timeout(300)
+
+    # Click submit
+    clicked = False
+    for sel in submit_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                clicked = True
+                break
+        except Exception:
+            pass
+
+    if not clicked:
+        logger.error("Кнопка входа не найдена")
+        return False
+
+    # Wait for redirect away from login page
     try:
         await page.wait_for_url(
             lambda url: "login" not in url and "challenge" not in url,
             timeout=15000,
         )
     except Exception:
-        logger.warning("Логин завершился, но редирект не произошёл — проверьте credentials")
+        logger.warning("Редирект после логина не произошёл — проверьте credentials")
 
-    await page.wait_for_timeout(3000)
-    await _dismiss_popups(page)
+    await page.wait_for_timeout(2000)
 
-    if "login" in page.url:
-        logger.error("Авторизация не удалась — неверный логин/пароль?")
+    # Dismiss "Save login info" / "onetap" / notifications prompts
+    onetap_selectors = [
+        'button:has-text("Not Now")',
+        'button:has-text("Not now")',
+        'button:has-text("Skip")',
+        'div[role="button"]:has-text("Not Now")',
+        'div[role="button"]:has-text("Not now")',
+    ]
+    for sel in onetap_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+    if "login" in page.url and "onetap" not in page.url:
+        logger.error("Авторизация не удалась — неверный логин/пароль или требуется 2FA")
         return False
 
     await context.storage_state(path=str(SESSION_FILE))
-    logger.info("Сессия Instagram сохранена.")
+    logger.info(f"Сессия Instagram сохранена. URL: {page.url}")
     return True
 
 
