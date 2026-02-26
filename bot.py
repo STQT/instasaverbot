@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,7 +11,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from downloader import extract_urls, download_media, cleanup
@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+
+# Webhook настройки
+MODE = os.getenv("MODE", "polling").lower()          # "webhook" или "polling"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")           # https://yourdomain.com
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
+WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_hex(32)
 
 # Максимальный размер файла для Telegram (50 МБ)
 MAX_FILE_SIZE_MB = 50
@@ -162,7 +169,6 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Слушаем сообщения во всех чатах (группах, каналах, личках)
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -170,8 +176,30 @@ def main() -> None:
         )
     )
 
-    logger.info("Бот запущен и слушает сообщения...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if MODE == "webhook":
+        if not WEBHOOK_URL:
+            raise ValueError("WEBHOOK_URL не задан в .env файле (нужен для webhook режима)!")
+
+        webhook_path = BOT_TOKEN
+        full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{webhook_path}"
+
+        logger.info(f"Запуск в режиме WEBHOOK: {full_webhook_url} (порт {WEBHOOK_PORT})")
+
+        app.run_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            url_path=webhook_path,
+            webhook_url=full_webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("Запуск в режиме POLLING...")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == "__main__":
