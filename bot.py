@@ -163,11 +163,36 @@ async def _send_media_group(files: list[Path], chat_id: int, reply_to: int, cont
         await _send_media_group(files[10:], chat_id, reply_to, context)
 
 
+async def post_init(app: Application) -> None:
+    """Runs after the bot starts — initialises Playwright session."""
+    ig_user = os.getenv("IG_USERNAME", "")
+    ig_pass = os.getenv("IG_PASSWORD", "")
+
+    if ig_user and ig_pass:
+        logger.info("Инициализация Playwright-сессии Instagram...")
+        try:
+            from downloader_playwright import refresh_session
+            ok = await refresh_session()
+            if ok:
+                logger.info("Playwright: сессия Instagram готова, куки экспортированы.")
+            else:
+                logger.warning("Playwright: не удалось войти в Instagram. Проверьте IG_USERNAME / IG_PASSWORD.")
+        except Exception as e:
+            logger.error(f"Playwright init error: {e}")
+    else:
+        logger.info("IG_USERNAME/IG_PASSWORD не заданы — Playwright авторизация отключена.")
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан в .env файле!")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(
         MessageHandler(

@@ -28,6 +28,16 @@ FACEBOOK_PATTERNS = [
 
 ALL_PATTERNS = INSTAGRAM_PATTERNS + FACEBOOK_PATTERNS
 
+# Ключевые слова, которые указывают на необходимость авторизации
+AUTH_ERROR_KEYWORDS = (
+    "login required",
+    "rate-limit",
+    "not available",
+    "cookies",
+    "authentication",
+    "sign in",
+)
+
 
 def extract_urls(text: str) -> list[str]:
     """Извлекает все Instagram и Facebook ссылки из текста."""
@@ -35,7 +45,12 @@ def extract_urls(text: str) -> list[str]:
     for pattern in ALL_PATTERNS:
         found = re.findall(pattern, text)
         urls.extend(found)
-    return list(dict.fromkeys(urls))  # убираем дубликаты
+    return list(dict.fromkeys(urls))
+
+
+def _is_auth_error(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    return any(kw in msg for kw in AUTH_ERROR_KEYWORDS)
 
 
 def _get_ydl_opts(output_path: str, cookies_file: Optional[str] = None) -> dict:
@@ -59,48 +74,34 @@ def _get_ydl_opts(output_path: str, cookies_file: Optional[str] = None) -> dict:
     return opts
 
 
-async def download_media(url: str, cookies_file: Optional[str] = None) -> list[Path]:
+def _run_ydl(url: str, output_template: str, cookies_file: Optional[str]) -> tuple[dict | None, str | None]:
     """
-    Скачивает медиа по URL.
-    Возвращает список скачанных файлов (видео или картинки).
+    Runs yt-dlp synchronously.
+    Returns (info_dict, error_message). One of them will be None.
     """
-    safe_name = re.sub(r"[^\w]", "_", url[-30:])
-    output_template = str(DOWNLOAD_DIR / f"{safe_name}_%(autonumber)s.%(ext)s")
-
-    ydl_opts = _get_ydl_opts(output_template, cookies_file)
-
-    loop = asyncio.get_event_loop()
-
-    def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return info
-
+    opts = _get_ydl_opts(output_template, cookies_file)
     try:
-        info = await loop.run_in_executor(None, _download)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return info, None
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp ошибка для {url}: {e}")
-        return []
+        return None, str(e)
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при скачивании {url}: {e}")
-        return []
+        return None, str(e)
 
+
+def _collect_files(info: dict, safe_name: str) -> list[Path]:
+    """Collects downloaded file paths from yt-dlp info dict."""
     downloaded = []
-
-    if info is None:
-        return downloaded
-
-    # Обработка плейлиста (например, альбомы или несколько историй)
     entries = info.get("entries") if "entries" in info else [info]
 
-    for entry in entries:
+    for entry in (entries or []):
         if entry is None:
             continue
         filepath = entry.get("requested_downloads", [{}])[0].get("filepath")
         if filepath and Path(filepath).exists():
             downloaded.append(Path(filepath))
         else:
-            # Попробуем найти файл по шаблону
             ext = entry.get("ext", "mp4")
             autonumber = entry.get("autonumber", 1)
             candidate = DOWNLOAD_DIR / f"{safe_name}_{autonumber:05d}.{ext}"
@@ -108,7 +109,6 @@ async def download_media(url: str, cookies_file: Optional[str] = None) -> list[P
                 downloaded.append(candidate)
 
     if not downloaded:
-        # Последняя попытка — ищем любые новые файлы в папке
         for f in DOWNLOAD_DIR.iterdir():
             if f.name.startswith(safe_name):
                 downloaded.append(f)
@@ -116,8 +116,57 @@ async def download_media(url: str, cookies_file: Optional[str] = None) -> list[P
     return downloaded
 
 
+async def download_media(url: str, cookies_file: Optional[str] = None) -> list[Path]:
+    """
+    Downloads media from URL using yt-dlp.
+    If the download fails with an auth error AND Playwright credentials are
+    configured, automatically refreshes cookies and retries once.
+    """
+    safe_name = re.sub(r"[^\w]", "_", url[-30:])
+    output_template = str(DOWNLOAD_DIR / f"{safe_name}_%(autonumber)s.%(ext)s")
+    loop = asyncio.get_event_loop()
+
+    # ── First attempt ────────────────────────────────────────────
+    info, error = await loop.run_in_executor(
+        None, _run_ydl, url, output_template, cookies_file
+    )
+
+    if info is not None:
+        return _collect_files(info, safe_name)
+
+    logger.error(f"yt-dlp ошибка для {url}: {error}")
+
+    # ── Auto-refresh cookies via Playwright and retry ─────────────
+    if error and _is_auth_error(error):
+        refreshed = await _try_refresh_cookies()
+        if refreshed and cookies_file:
+            logger.info("Куки обновлены — повторная попытка скачивания...")
+            info, error2 = await loop.run_in_executor(
+                None, _run_ydl, url, output_template, cookies_file
+            )
+            if info is not None:
+                return _collect_files(info, safe_name)
+            logger.error(f"Повторная попытка также не удалась: {error2}")
+
+    return []
+
+
+async def _try_refresh_cookies() -> bool:
+    """Tries to refresh cookies using Playwright. Returns True on success."""
+    try:
+        from downloader_playwright import refresh_session
+        logger.info("Обновляю сессию через Playwright...")
+        return await refresh_session()
+    except ImportError:
+        logger.warning("downloader_playwright не найден — авто-рефреш недоступен")
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка обновления сессии: {e}")
+        return False
+
+
 def cleanup(files: list[Path]) -> None:
-    """Удаляет временные файлы после отправки."""
+    """Deletes temporary files after sending."""
     for f in files:
         try:
             if f.exists():
